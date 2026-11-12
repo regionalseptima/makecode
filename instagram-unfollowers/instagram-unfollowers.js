@@ -34,6 +34,17 @@
   const jitter = (base) => base + Math.floor(Math.random() * base * 0.5);
 
   class RateLimitError extends Error {}
+  // Instagram ha bloqueado la acción o pide verificar la cuenta: no tiene
+  // sentido reintentar por otra vía.
+  class BlockedError extends Error {}
+
+  const storage = (key) => {
+    try {
+      return sessionStorage.getItem(key) || localStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  };
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
@@ -41,14 +52,33 @@
       ...options,
       headers: {
         'X-IG-App-ID': APP_ID,
+        'X-ASBD-ID': '129477',
+        'X-IG-WWW-Claim': storage('www-claim-v2') || '0',
         'X-Requested-With': 'XMLHttpRequest',
         'X-CSRFToken': cookie('csrftoken') || '',
         ...(options.headers || {}),
       },
     });
     if (res.status === 429) throw new RateLimitError('Instagram pide esperar (límite de peticiones).');
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return res.json();
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      // respuesta no JSON (p. ej. una página de inicio de sesión)
+    }
+    if (!res.ok || !json) {
+      const reason = (json && (json.message || json.error_type || json.feedback_message)) || '';
+      const detail = 'HTTP ' + res.status + (reason ? ': ' + reason : '');
+      if (
+        /feedback_required|checkpoint_required|challenge_required|login_required/.test(reason) ||
+        (json && json.spam)
+      ) {
+        throw new BlockedError(detail);
+      }
+      throw new Error(detail);
+    }
+    return json;
   }
 
   // ---------- Obtención de datos ----------
@@ -136,14 +166,20 @@
       api(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: '',
+        body: 'container_module=profile&user_id=' + encodeURIComponent(userId),
       });
     let json;
     try {
       json = await post('/api/v1/friendships/destroy/' + userId + '/');
     } catch (err) {
-      if (err instanceof RateLimitError) throw err;
-      json = await post('/web/friendships/' + userId + '/unfollow/');
+      if (err instanceof RateLimitError || err instanceof BlockedError) throw err;
+      console.warn('[no-follow-back] Primera vía falló (' + err.message + '), probando la segunda');
+      try {
+        json = await post('/web/friendships/' + userId + '/unfollow/');
+      } catch (err2) {
+        if (err2 instanceof RateLimitError || err2 instanceof BlockedError) throw err2;
+        throw new Error(err.message + ' / ' + err2.message);
+      }
     }
     if (!json || json.status !== 'ok') throw new Error('Instagram rechazó la acción');
   }
@@ -286,9 +322,13 @@
         btn.textContent = 'Reintentar';
         btn.style.opacity = '1';
         btn.style.cursor = 'pointer';
+        console.error('[no-follow-back] No se pudo dejar de seguir a @' + user.username + ':', err);
         error.textContent =
           err instanceof RateLimitError
             ? 'Instagram pide ir más despacio. Espera unos minutos y reintenta.'
+            : err instanceof BlockedError
+            ? 'Instagram ha bloqueado esta acción en tu cuenta por ahora (' + err.message +
+              '). Prueba a dejar de seguir a alguien a mano: si tampoco deja, toca esperar unas horas.'
             : 'No se pudo dejar de seguir (' + err.message + ').';
         error.style.display = 'block';
       }
