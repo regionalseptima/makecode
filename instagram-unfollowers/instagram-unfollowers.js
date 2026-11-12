@@ -10,7 +10,8 @@
 (async () => {
   'use strict';
 
-  const APP_ID = '936619743392459'; // identificador público de la web de Instagram
+  const APP_ID = '936619743392459'; // identificadores públicos de la web de Instagram
+  const ASBD_ID = '359341';
   const FOLLOWING_QUERY_HASH = '3dec7e2c57367ef3da3d987d89f9dbc8';
   const PANEL_ID = 'ig-nofollowback-panel';
   const UNFOLLOW_GAP_MS = 1500; // espera mínima entre dos "dejar de seguir"
@@ -46,39 +47,70 @@
     }
   };
 
-  async function api(path, options = {}) {
+  // Cabeceras que envía la propia web de Instagram en sus llamadas /api/v1.
+  const webSessionId = [0, 0, 0]
+    .map(() => Math.random().toString(36).slice(2, 8).padEnd(6, '0'))
+    .join(':');
+  let wwwClaim = storage('www-claim-v2') || '0';
+
+  function igHeaders(extra = {}) {
+    return {
+      'X-IG-App-ID': APP_ID,
+      'X-ASBD-ID': ASBD_ID,
+      'X-IG-WWW-Claim': wwwClaim,
+      'X-Web-Session-ID': webSessionId,
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-CSRFToken': cookie('csrftoken') || '',
+      Accept: '*/*',
+      ...extra,
+    };
+  }
+
+  // Devuelve { res, json, text }; json es null si la respuesta no es JSON
+  // (Instagram contesta a rutas desconocidas con una página HTML y HTTP 200).
+  async function request(path, options = {}) {
     const res = await fetch(path, {
-      credentials: 'include',
+      credentials: 'same-origin',
       ...options,
-      headers: {
-        'X-IG-App-ID': APP_ID,
-        'X-ASBD-ID': '129477',
-        'X-IG-WWW-Claim': storage('www-claim-v2') || '0',
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-CSRFToken': cookie('csrftoken') || '',
-        ...(options.headers || {}),
-      },
+      headers: igHeaders(options.headers),
     });
-    if (res.status === 429) throw new RateLimitError('Instagram pide esperar (límite de peticiones).');
-    const text = await res.text();
+    const claim = res.headers.get('x-ig-set-www-claim');
+    if (claim) wwwClaim = claim;
+    const text = await res.text().catch(() => '');
     let json = null;
     try {
-      json = JSON.parse(text);
+      json = JSON.parse(text.replace(/^for \(;;\);/, ''));
     } catch (e) {
-      // respuesta no JSON (p. ej. una página de inicio de sesión)
+      // no es JSON
     }
-    if (!res.ok || !json) {
-      const reason = (json && (json.message || json.error_type || json.feedback_message)) || '';
-      const detail = 'HTTP ' + res.status + (reason ? ': ' + reason : '');
-      if (
-        /feedback_required|checkpoint_required|challenge_required|login_required/.test(reason) ||
-        (json && json.spam)
-      ) {
-        throw new BlockedError(detail);
-      }
-      throw new Error(detail);
+    return { res, json, text };
+  }
+
+  function describeFailure({ res, json, text }) {
+    if (json) {
+      const reason = json.message || json.error_type || json.feedback_message || json.errorSummary;
+      return 'HTTP ' + res.status + ': ' + (reason || JSON.stringify(json).slice(0, 200));
     }
-    return json;
+    return 'HTTP ' + res.status + ', respuesta no válida (' + (res.headers.get('content-type') || 'sin tipo') + ')';
+  }
+
+  function throwIfBlocked(r) {
+    if (r.res.status === 429) throw new RateLimitError('Instagram pide esperar (límite de peticiones).');
+    const j = r.json || {};
+    const reason = [j.message, j.error_type, j.feedback_message, j.errorSummary].join(' ');
+    if (
+      j.spam === true ||
+      /feedback_required|checkpoint|challenge_required|login_required|action_blocked|try again later/i.test(reason)
+    ) {
+      throw new BlockedError(describeFailure(r));
+    }
+  }
+
+  async function api(path, options = {}) {
+    const r = await request(path, options);
+    throwIfBlocked(r);
+    if (!r.res.ok || !r.json) throw new Error(describeFailure(r));
+    return r.json;
   }
 
   // ---------- Obtención de datos ----------
@@ -117,6 +149,8 @@
         });
       }
       onProgress('Leyendo seguidos… ' + result.length + ' de ' + edge.count);
+      // Instagram a veces devuelve el total correcto pero la lista vacía.
+      if (edge.edges.length === 0 && result.length < edge.count) throw new Error('Lista de seguidos vacía');
       if (!edge.page_info.has_next_page) break;
       after = edge.page_info.end_cursor;
       await pace(++page);
@@ -161,33 +195,109 @@
     }));
   }
 
-  async function unfollow(userId) {
-    const post = (path) =>
-      api(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'container_module=profile&user_id=' + encodeURIComponent(userId),
-      });
-    let json;
+  // Tokens de sesión (fb_dtsg) que la web de Instagram adjunta a sus acciones.
+  let sessionTokens = null;
+  function tokensFromHtml(html) {
+    const m =
+      /"DTSGInitialData",\[\],\{"token":"([^"]+)"/.exec(html) || /"dtsg":\{"token":"([^"]+)"/.exec(html);
+    if (!m) return null;
+    const rev = /"client_revision":(\d+)/.exec(html);
+    return { fbDtsg: m[1], revision: rev ? rev[1] : '' };
+  }
+  async function getSessionTokens() {
+    if (sessionTokens) return sessionTokens;
     try {
-      json = await post('/api/v1/friendships/destroy/' + userId + '/');
-    } catch (err) {
-      if (err instanceof RateLimitError || err instanceof BlockedError) throw err;
-      console.warn('[no-follow-back] Primera vía falló (' + err.message + '), probando la segunda');
+      if (typeof window.require === 'function') {
+        const fbDtsg = (window.require('DTSGInitialData') || {}).token;
+        if (fbDtsg) {
+          const site = window.require('SiteData') || {};
+          sessionTokens = { fbDtsg, revision: site.client_revision ? String(site.client_revision) : '' };
+          return sessionTokens;
+        }
+      }
+    } catch (e) {
+      // registro de módulos no disponible: se busca en el HTML
+    }
+    sessionTokens = tokensFromHtml(document.documentElement.innerHTML);
+    if (!sessionTokens) {
       try {
-        json = await post('/web/friendships/' + userId + '/unfollow/');
-      } catch (err2) {
-        if (err2 instanceof RateLimitError || err2 instanceof BlockedError) throw err2;
-        throw new Error(err.message + ' / ' + err2.message);
+        const res = await fetch('/', { credentials: 'same-origin' });
+        sessionTokens = tokensFromHtml(await res.text());
+      } catch (e) {
+        // se informa abajo
       }
     }
-    if (!json || json.status !== 'ok') throw new Error('Instagram rechazó la acción');
+    return sessionTokens;
+  }
+
+  // Suma de comprobación que Instagram envía junto a fb_dtsg.
+  function jazoest(fbDtsg) {
+    let sum = 0;
+    for (let i = 0; i < fbDtsg.length; i++) sum += fbDtsg.charCodeAt(i);
+    return '2' + sum;
+  }
+
+  function findFriendshipStatus(node) {
+    if (node === null || typeof node !== 'object') return undefined;
+    if (node.friendship_status && typeof node.friendship_status === 'object') return node.friendship_status;
+    for (const value of Object.values(node)) {
+      const found = findFriendshipStatus(value);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+
+  // Busca la cuenta en tu lista de seguidos. Devuelve null si no se pudo comprobar.
+  async function isStillFollowing(user) {
+    try {
+      const json = await api(
+        '/api/v1/friendships/' + myId + '/following/?count=12&query=' +
+          encodeURIComponent(user.username) + '&search_surface=follow_list_page'
+      );
+      if (!Array.isArray(json.users)) return null;
+      return json.users.some((u) => String(u.pk) === user.id || u.username === user.username);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Deja de seguir igual que el botón de la web y solo lo da por hecho cuando
+  // Instagram confirma que ya no sigues a la cuenta: un HTTP 200 no basta.
+  async function unfollow(user) {
+    const tokens = await getSessionTokens();
+    if (!tokens) throw new Error('no se encontró el token de sesión; recarga la página y vuelve a pegar el script');
+    const body = new URLSearchParams({
+      container_module: 'profile',
+      nav_chain: 'PolarisProfilePostsTabRoot:profilePage:1:via_cold_start',
+      user_id: user.id,
+      jazoest: jazoest(tokens.fbDtsg),
+      fb_dtsg: tokens.fbDtsg,
+    });
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    if (tokens.revision) headers['X-Instagram-AJAX'] = tokens.revision;
+
+    const r = await request('/api/v1/friendships/destroy/' + user.id + '/', {
+      method: 'POST',
+      headers,
+      body: body.toString(),
+    });
+    throwIfBlocked(r);
+    if (!r.res.ok || !r.json || r.json.status !== 'ok') throw new Error(describeFailure(r));
+
+    const fs = findFriendshipStatus(r.json);
+    if (fs && fs.following === false && !fs.outgoing_request) return;
+    if (fs && (fs.following === true || fs.outgoing_request === true)) {
+      throw new Error('Instagram respondió pero sigues siguiendo a la cuenta');
+    }
+    const still = await isStillFollowing(user);
+    if (still === true) throw new Error('Instagram respondió pero la cuenta sigue en tu lista de seguidos');
+    if (still === null) throw new Error('no se pudo confirmar; mira el perfil antes de reintentar');
   }
 
   // Los "dejar de seguir" se ejecutan de uno en uno y espaciados.
   let unfollowChain = Promise.resolve();
-  function queueUnfollow(userId) {
-    const run = unfollowChain.then(() => unfollow(userId));
+  function queueUnfollow(user) {
+    const run = unfollowChain.then(() => unfollow(user));
     unfollowChain = run.then(
       () => sleep(UNFOLLOW_GAP_MS),
       () => sleep(UNFOLLOW_GAP_MS)
@@ -309,7 +419,7 @@
       btn.style.cursor = 'default';
       error.style.display = 'none';
       try {
-        await queueUnfollow(user.id);
+        await queueUnfollow(user);
         btn.textContent = 'Ya no lo sigues';
         btn.style.background = '#efefef';
         btn.style.color = '#555';
@@ -353,7 +463,7 @@
     try {
       users = await scanGraphql(setStatus);
     } catch (err) {
-      if (err instanceof RateLimitError) throw err;
+      if (err instanceof RateLimitError || err instanceof BlockedError) throw err;
       console.warn('[no-follow-back] Método principal falló, probando el alternativo:', err);
       users = await scanRest(setStatus);
       if (users) {
